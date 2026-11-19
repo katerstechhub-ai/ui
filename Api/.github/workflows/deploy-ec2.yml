@@ -1,0 +1,75 @@
+name: Provision and Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: Secret access key
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies & Build
+        run: |
+          npm ci
+          npm run build --if-present
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ACCESSKEYID }}
+          aws-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
+          aws-region: eu-north-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init & Apply
+        working-directory: ./terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve -var="key_name=${{ secrets.EC2_KEY_NAME }}"
+
+      - name: Extract EC2 IP Address
+        working-directory: ./terraform
+        run: |
+          DYNAMIC_IP=$(terraform output -raw ec2_public_ip)
+          echo "EC2_HOST=$DYNAMIC_IP" >> $GITHUB_ENV
+          echo "Provisioned IP: $DYNAMIC_IP"
+
+      - name: Wait for SSH Daemon to Boot
+        run: sleep 45
+
+      - name: Copy Files to EC2 Target
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: ".,!node_modules,!.git,!terraform"
+          target: "/home/ubuntu/app"
+
+      - name: Restart PM2 Application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cloud-init status --wait
+            cd /home/ubuntu/app
+            npm install --omit=dev
+            pm2 restart app --update-env || pm2 start index.js --name app
