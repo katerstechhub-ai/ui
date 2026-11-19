@@ -1,0 +1,79 @@
+name: Deploy UI to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy-ui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ACCESSKEYID }}
+          aws-secret-access-key: ${{ secrets.SECRETACCESSKEY }}
+          aws-region: eu-north-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init & Apply
+        working-directory: ./terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Extract Backend IP
+        working-directory: ./terraform
+        run: |
+          DYNAMIC_IP=$(terraform output -raw ec2_public_ip)
+          echo "EC2_HOST=$DYNAMIC_IP" >> $GITHUB_ENV
+          echo "Backend IP: $DYNAMIC_IP"
+
+      - name: Install Dependencies & Build
+        run: |
+          npm ci
+          npm run build
+        env:
+          VITE_API_URL: http://${{ env.EC2_HOST }}:5000
+
+      - name: Copy Build to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "dist/*"
+          target: "/home/ubuntu/ui"
+          strip_components: 1
+
+      - name: Serve with Nginx
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            if ! command -v nginx > /dev/null; then
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+            fi
+            sudo rm -rf /var/www/html/*
+            sudo cp -r /home/ubuntu/ui/* /var/www/html/
+            sudo systemctl enable --now nginx
+            echo "UI live"
